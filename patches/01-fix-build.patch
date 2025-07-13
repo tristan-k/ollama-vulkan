@@ -1,0 +1,60 @@
+diff --git a/CMakePresets.json b/CMakePresets.json
+index 0b70d8ba..93d6ef87 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -60,6 +60,10 @@
+       "cacheVariables": {
+         "AMDGPU_TARGETS": "gfx900;gfx940;gfx941;gfx942;gfx1010;gfx1012;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201;gfx906:xnack-;gfx908:xnack-;gfx90a:xnack+;gfx90a:xnack-"
+       }
++    },
++    {
++      "name": "Vulkan",
++      "inherits": [ "Default" ]
+     }
+   ],
+   "buildPresets": [
+@@ -107,6 +111,11 @@
+       "name": "ROCm 6",
+       "inherits": [ "ROCm" ],
+       "configurePreset": "ROCm 6"
++    },
++    {
++      "name": "Vulkan",
++      "targets": [ "ggml-vulkan" ],
++      "configurePreset": "Vulkan"
+     }
+   ]
+ }
+diff --git a/discover/gpu.go b/discover/gpu.go
+index 086ad34d..123177d3 100644
+--- a/discover/gpu.go
++++ b/discover/gpu.go
+@@ -196,7 +196,10 @@ func initVulkanHandles() *vulkanHandles {
+ 	libcapPaths := FindLibCapLibs()
+ 
+ 	if len(vulkanPaths) > 0 && len(libcapPaths) > 0 {
++		slog.Info("vulkan: load libvulkan and libcap ok")
+ 		vHandles.deviceCount, vHandles.vulkan, vulkanLibPath, libcapLibPath = LoadVulkanMgmt(vulkanPaths, libcapPaths)
++	} else {
++		slog.Info("vulkan: failed to load libvulkan or libcap")
+ 	}
+ 
+ 	return vHandles
+@@ -425,7 +428,7 @@ func GetGPUInfo() GpuInfoList {
+ 				gpuInfo.ID = C.GoString(&memInfo.gpu_id[0])
+ 				gpuInfo.Compute = fmt.Sprintf("%d.%d", memInfo.major, memInfo.minor)
+ 				gpuInfo.MinimumMemory = 0
+-				gpuInfo.DependencyPath = depPaths
++				gpuInfo.DependencyPath = []string{LibOllamaPath}
+ 				gpuInfo.Name = C.GoString(&memInfo.gpu_name[0])
+ 				gpuInfo.DriverMajor = int(memInfo.major)
+ 				gpuInfo.DriverMinor = int(memInfo.minor)
+@@ -767,7 +770,7 @@ func LoadVulkanMgmt(vulkanLibPaths []string, capLibPaths []string) (int, *C.vk_h
+ 
+ 			C.vk_init(vkLib, capLib, &resp)
+ 			if resp.err != nil {
+-				slog.Debug("Unable to load vulkan", "library", vkLibPath, capLibPath, "error", C.GoString(resp.err))
++				slog.Error("Unable to load vulkan", "library", vkLibPath, capLibPath, "error", C.GoString(resp.err))
+ 				C.free(unsafe.Pointer(resp.err))
+ 			} else {
+ 				return int(resp.num_devices), &resp.ch, vkLibPath, capLibPath

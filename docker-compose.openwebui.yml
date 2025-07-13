@@ -1,0 +1,50 @@
+services:
+  ollama-vk:
+    image: ollama-vulkan:latest
+    container_name: ollama-vulkan-whyvl
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "11434:11434"
+    networks:
+      - ollama-docker
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd
+    environment:
+      - OLLAMA_LLM_LIBRARY=vulkan
+    cap_add:
+      - CAP_PERFMON
+    privileged: true # Uncomment this if you have problems with GPU detection
+    group_add:
+      - video
+      - 39 # Change this to match your "render" host group id and remove this comment
+    volumes:
+      - ollama-data:/root/.ollama
+
+  webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: ollama-vulkan-whyvl-open-webui
+    volumes:
+      - webui-data:/app/backend/data
+    depends_on:
+      - ollama-vk
+    ports:
+      - 8080:8080
+    environment:
+      - OLLAMA_BASE_URLS=http://ollama-vk:11434
+      - ENV=dev
+      - WEBUI_AUTH=False
+      - WEBUI_NAME=OpenWebUI
+      - WEBUI_URL=http://localhost:8080
+      - WEBUI_SECRET_KEY=t0p-s3cr3t
+    networks:
+      - ollama-docker
+
+volumes:
+  ollama-data:
+  webui-data:
+
+networks:
+  ollama-docker:

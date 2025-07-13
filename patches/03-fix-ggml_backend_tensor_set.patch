@@ -1,0 +1,32 @@
+diff --git a/ml/backend/ggml/ggml.go b/ml/backend/ggml/ggml.go
+index 76172ae1..8baa6609 100644
+--- a/ml/backend/ggml/ggml.go
++++ b/ml/backend/ggml/ggml.go
+@@ -22,6 +22,7 @@ import (
+ 	"sync/atomic"
+ 	"unicode"
+ 	"unsafe"
++	"sync"
+ 
+ 	"github.com/ollama/ollama/format"
+ 	"github.com/ollama/ollama/fs"
+@@ -421,6 +422,7 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
+ 
+ 	g, ctx := errgroup.WithContext(ctx)
+ 	g.SetLimit(runtime.GOMAXPROCS(0))
++	var tensorSetMutex sync.Mutex
+ 	for _, t := range b.meta.Tensors().Items() {
+ 		t := t
+ 		g.Go(func() error {
+@@ -463,9 +465,11 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
+ 					return err
+ 				}
+ 
++				tensorSetMutex.Lock()
+ 				for _, tt := range tts {
+ 					C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
+ 				}
++				tensorSetMutex.Unlock()
+ 
+ 				s += uint64(n)
+ 

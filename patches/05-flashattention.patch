@@ -1,0 +1,253 @@
+diff --git a/discover/amd_linux.go b/discover/amd_linux.go
+index 830fa1df..06e90739 100644
+--- a/discover/amd_linux.go
++++ b/discover/amd_linux.go
+@@ -279,12 +279,13 @@ func AMDGetGPUInfo() ([]RocmGPUInfo, error) {
+ 					TotalMemory: totalMemory,
+ 					FreeMemory:  (totalMemory - usedMemory),
+ 				},
+-				ID:            ID,
+-				Name:          name,
+-				Compute:       fmt.Sprintf("gfx%d%x%x", major, minor, patch),
+-				MinimumMemory: rocmMinimumMemory,
+-				DriverMajor:   driverMajor,
+-				DriverMinor:   driverMinor,
++				ID:             ID,
++				Name:           name,
++				Compute:        fmt.Sprintf("gfx%d%x%x", major, minor, patch),
++				MinimumMemory:  rocmMinimumMemory,
++				FlashAttention: true, // Supposedly ROCm supports it everywhere
++				DriverMajor:    driverMajor,
++				DriverMinor:    driverMinor,
+ 			},
+ 			usedFilepath: usedFile,
+ 			index:        gpuID,
+diff --git a/discover/gpu.go b/discover/gpu.go
+index 123177d3..842e817c 100644
+--- a/discover/gpu.go
++++ b/discover/gpu.go
+@@ -310,6 +310,7 @@ func GetGPUInfo() GpuInfoList {
+ 					C.free(unsafe.Pointer(memInfo.err))
+ 					continue
+ 				}
++				gpuInfo.FlashAttention = driverMajor >= 7
+ 				gpuInfo.TotalMemory = uint64(memInfo.total)
+ 				gpuInfo.FreeMemory = uint64(memInfo.free)
+ 				gpuInfo.ID = C.GoString(&memInfo.gpu_id[0])
+@@ -394,6 +395,7 @@ func GetGPUInfo() GpuInfoList {
+ 						// TODO - convert this to MinimumMemory based on testing...
+ 						var totalFreeMem float64 = float64(memInfo.free) * 0.95 // work-around: leave some reserve vram for mkl lib used in ggml-sycl backend.
+ 						memInfo.free = C.uint64_t(totalFreeMem)
++						gpuInfo.FlashAttention = false
+ 						gpuInfo.TotalMemory = uint64(memInfo.total)
+ 						gpuInfo.FreeMemory = uint64(memInfo.free)
+ 						gpuInfo.ID = C.GoString(&memInfo.gpu_id[0])
+@@ -423,6 +425,7 @@ func GetGPUInfo() GpuInfoList {
+ 					continue
+ 				}
+ 
++				gpuInfo.FlashAttention = (C.vk_check_flash_attention(*vHandles.vulkan, C.int(i)) == 0) // 0 means supported
+ 				gpuInfo.TotalMemory = uint64(memInfo.total)
+ 				gpuInfo.FreeMemory = uint64(memInfo.free)
+ 				gpuInfo.ID = C.GoString(&memInfo.gpu_id[0])
+diff --git a/discover/gpu_info_vulkan.c b/discover/gpu_info_vulkan.c
+index e868dcc1..cac4d9c3 100644
+--- a/discover/gpu_info_vulkan.c
++++ b/discover/gpu_info_vulkan.c
+@@ -24,18 +24,32 @@ int check_perfmon(vk_handle_t* rh) {
+   return 0;
+ }
+ 
+-int support_memory_budget(vk_handle_t* rh, VkPhysicalDevice device) {
++int is_extension_supported(vk_handle_t* rh, VkPhysicalDevice device, char* extension) {
+   VkPhysicalDeviceProperties properties;
+   (*rh->vkGetPhysicalDeviceProperties)(device, &properties);
++
+   uint32_t extensionCount;
+   (*rh->vkEnumerateDeviceExtensionProperties)(device, NULL, &extensionCount, NULL);
++
++  if (extensionCount == 0) {
++    return 0;
++  }
++
+   VkExtensionProperties* extensions = malloc(extensionCount * sizeof(VkExtensionProperties));
++  if (extensions == NULL) {
++    return 0;
++  }
++
+   (*rh->vkEnumerateDeviceExtensionProperties)(device, NULL, &extensionCount, extensions);
++
+   for (int j = 0; j < extensionCount; j++) {
+-    if (strcmp(extensions[j].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
++    if (strcmp(extensions[j].extensionName, extension) == 0) {
++      free(extensions);
+       return 1;
+     }
+   }
++
++  free(extensions);
+   return 0;
+ }
+ 
+@@ -125,6 +139,7 @@ void vk_init(char* vk_lib_path, char* cap_lib_path, vk_init_resp_t *resp) {
+   }
+ 
+   VkInstance instance;
++
+   VkApplicationInfo appInfo = {};
+   appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+   appInfo.pNext = NULL;
+@@ -133,6 +148,7 @@ void vk_init(char* vk_lib_path, char* cap_lib_path, vk_init_resp_t *resp) {
+   appInfo.pEngineName = "No Engine";
+   appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+   appInfo.apiVersion = VK_API_VERSION_1_2;
++
+   VkInstanceCreateInfo createInfo = {};
+   createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+   createInfo.pNext = NULL;
+@@ -141,6 +157,7 @@ void vk_init(char* vk_lib_path, char* cap_lib_path, vk_init_resp_t *resp) {
+   const char* extensions[] = { VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME };
+   createInfo.ppEnabledExtensionNames = extensions;
+   createInfo.pApplicationInfo = &appInfo;
++
+   VkResult result = (*resp->ch.vkCreateInstance)(&createInfo, NULL, &instance);
+   if (result != VK_SUCCESS) {
+     resp->err = strdup("failed to create instance");
+@@ -160,25 +177,63 @@ void vk_init(char* vk_lib_path, char* cap_lib_path, vk_init_resp_t *resp) {
+   resp->num_devices = deviceCount;
+ }
+ 
++int vk_check_flash_attention(vk_handle_t rh, int i) {
++  VkInstance instance = rh.vk;
++  uint32_t deviceCount = rh.num_devices;
++
++  VkPhysicalDevice* devices = malloc(deviceCount * sizeof(VkPhysicalDevice));
++  if (devices == NULL) {
++    return 0;
++  }
++
++  VkResult result = (*rh.vkEnumeratePhysicalDevices)(instance, &deviceCount, devices);
++  if (result != VK_SUCCESS) {
++    free(devices);
++    return 0;
++  }
++
++  VkPhysicalDeviceProperties properties;
++  (*rh.vkGetPhysicalDeviceProperties)(devices[i], &properties);
++
++  int supports_nv_coopmat2 = is_extension_supported(&rh, devices[i], "VK_NV_cooperative_matrix2");
++  if (!supports_nv_coopmat2) {
++    free(devices);
++    return 1;
++  }
++
++  free(devices);
++  return 0;
++}
++
+ void vk_check_vram(vk_handle_t rh, int i, mem_info_t *resp) {
+   VkInstance instance = rh.vk;
+   uint32_t deviceCount = rh.num_devices;
+ 
+   VkPhysicalDevice* devices = malloc(deviceCount * sizeof(VkPhysicalDevice));
++  if (devices == NULL) {
++    resp->err = strdup("memory allocation failed for devices array");
++    return;
++  }
++
+   VkResult result = (*rh.vkEnumeratePhysicalDevices)(instance, &deviceCount, devices);
+   if (result != VK_SUCCESS) {
++    free(devices);
+     resp->err = strdup("failed to enumerate physical devices");
+     return;
+   }
+ 
+   VkPhysicalDeviceProperties properties;
+   (*rh.vkGetPhysicalDeviceProperties)(devices[i], &properties);
+-  int supports_budget = support_memory_budget(&rh, devices[i]);
++
++  int supports_budget = is_extension_supported(&rh, devices[i], VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+   if (!supports_budget) {
++    free(devices);
+     resp->err = strdup("device does not support memory budget");
+     return;
+   }
++
+   if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
++    free(devices);
+     resp->err = strdup("device is a CPU");
+     return;
+   }
+@@ -204,6 +259,8 @@ void vk_check_vram(vk_handle_t rh, int i, mem_info_t *resp) {
+     }
+   }
+ 
++  free(devices);
++
+   resp->err = NULL;
+   snprintf(&resp->gpu_id[0], GPU_ID_LEN, "%d", i);
+   resp->gpu_name[GPU_NAME_LEN - 1] = '\0';
+@@ -220,6 +277,7 @@ void vk_release(vk_handle_t rh) {
+   (*rh.vkDestroyInstance)(rh.vk, NULL);
+   UNLOAD_LIBRARY(rh.vk_handle);
+   rh.vk_handle = NULL;
++
+ #ifdef __linux__
+   LOG(rh.verbose, "releasing libcap library\n");
+   UNLOAD_LIBRARY(rh.cap_handle);
+diff --git a/discover/gpu_info_vulkan.h b/discover/gpu_info_vulkan.h
+index 6025f3e0..1f19be58 100644
+--- a/discover/gpu_info_vulkan.h
++++ b/discover/gpu_info_vulkan.h
+@@ -60,6 +60,7 @@ typedef struct vk_init_resp
+ 
+ void vk_init(char* vk_lib_path, char* cap_lib_path, vk_init_resp_t *resp);
+ void vk_check_vram(vk_handle_t rh, int i, mem_info_t *resp);
++int vk_check_flash_attention(vk_handle_t rh, int i);
+ void vk_release(vk_handle_t rh);
+ 
+ #endif
+diff --git a/discover/types.go b/discover/types.go
+index 11a3acec..b096b9e2 100644
+--- a/discover/types.go
++++ b/discover/types.go
+@@ -36,9 +36,10 @@ type GpuInfo struct { // TODO better name maybe "InferenceProcessor"?
+ 	UnreliableFreeMemory bool
+ 
+ 	// GPU information
+-	ID      string `json:"gpu_id"`  // string to use for selection of this specific GPU
+-	Name    string `json:"name"`    // user friendly name if available
+-	Compute string `json:"compute"` // Compute Capability or gfx
++	ID             string `json:"gpu_id"`          // string to use for selection of this specific GPU
++	Name           string `json:"name"`            // user friendly name if available
++	Compute        string `json:"compute"`         // Compute Capability or gfx
++	FlashAttention bool   `json:"flash_attention"` // is flash attention supported
+ 
+ 	// Driver Information - TODO no need to put this on each GPU
+ 	DriverMajor int `json:"driver_major,omitempty"`
+@@ -178,11 +179,7 @@ func (si SystemInfo) GetOptimalThreadCount() int {
+ // For each GPU, check if it does NOT support flash attention
+ func (l GpuInfoList) FlashAttentionSupported() bool {
+ 	for _, gpu := range l {
+-		supportsFA := gpu.Library == "metal" ||
+-			(gpu.Library == "cuda" && gpu.DriverMajor >= 7) ||
+-			gpu.Library == "rocm"
+-
+-		if !supportsFA {
++		if !gpu.FlashAttention {
+ 			return false
+ 		}
+ 	}
+diff --git a/envconfig/config.go b/envconfig/config.go
+index 1828af1c..19cf8446 100644
+--- a/envconfig/config.go
++++ b/envconfig/config.go
+@@ -289,7 +289,7 @@ func AsMap() map[string]EnvVar {
+ 		ret["CUDA_VISIBLE_DEVICES"] = EnvVar{"CUDA_VISIBLE_DEVICES", CudaVisibleDevices(), "Set which NVIDIA devices are visible"}
+ 		ret["HIP_VISIBLE_DEVICES"] = EnvVar{"HIP_VISIBLE_DEVICES", HipVisibleDevices(), "Set which AMD devices are visible by numeric ID"}
+ 		ret["ROCR_VISIBLE_DEVICES"] = EnvVar{"ROCR_VISIBLE_DEVICES", RocrVisibleDevices(), "Set which AMD devices are visible by UUID or numeric ID"}
+-		ret["GGML_VK_VISIBLE_DEVICES"] = EnvVar{"GGML_VK_VISIBLE_DEVICES", VkVisibleDevices(), "Set which VK AMD devices are visible by numeric ID"}
++		ret["GGML_VK_VISIBLE_DEVICES"] = EnvVar{"GGML_VK_VISIBLE_DEVICES", VkVisibleDevices(), "Set which Vulkan devices are visible by numeric ID"}
+ 		ret["GPU_DEVICE_ORDINAL"] = EnvVar{"GPU_DEVICE_ORDINAL", GpuDeviceOrdinal(), "Set which AMD devices are visible by numeric ID"}
+ 		ret["HSA_OVERRIDE_GFX_VERSION"] = EnvVar{"HSA_OVERRIDE_GFX_VERSION", HsaOverrideGfxVersion(), "Override the gfx used for all detected AMD GPUs"}
+ 		ret["OLLAMA_INTEL_GPU"] = EnvVar{"OLLAMA_INTEL_GPU", IntelGPU(), "Enable experimental Intel GPU detection"}
